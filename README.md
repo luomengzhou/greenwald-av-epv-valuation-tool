@@ -1,23 +1,42 @@
-# greenwald-av-epv-valuation-tool
+# Greenwald Valuation Tool — Asset Value · Earnings Power · Franchise Value
 
-Python / Streamlit tool for **Bruce Greenwald-style** equity valuation:
+A Streamlit app and a reusable Python package for valuing a company the way Bruce Greenwald teaches it at Columbia. You build value in three layers and compare each one against the market price:
 
-- **AV** — Asset Value  
-- **EPV** — Earnings Power Value  
-- **FV** — Franchise Value (growth / competitive advantage)
+1. **Asset Value (AV):** reproduction cost of the balance sheet. Book values are adjusted for intangibles the accounts leave out: brand (royalty and marketing-capitalisation methods), workforce, R&D product portfolio, PP&E and goodwill.
+2. **Earnings Power Value (EPV):** normalised, no-growth earnings ÷ cost of capital. Depreciation is split into maintenance and growth capex, and growth-related marketing and R&D spend is added back.
+3. **Franchise / Growth Value (FV):** what growth is worth. Growth creates value only when ROIC exceeds WACC, and the reinvestment rate *k* is solved from growth capex.
 
-Not a course archive. Use this when you want to run the valuation app or reuse the `valuation/` package on a ticker.
+When AV ≈ EPV, there is no moat. When EPV > AV, the gap is the franchise. When the market price exceeds EPV, the price is paying for growth, and that growth needs to be justified.
 
-## Quick start
+## What's in the code
+
+| Module | Contents |
+|---|---|
+| `valuation/asset_value.py` | AV calculator with line-by-line reproduction-cost adjustments |
+| `valuation/adjustments.py` | Brand, workforce, R&D, PP&E, goodwill, and growth-capex adjustment methods |
+| `valuation/earning_power.py` | EPV from adjusted NOPAT and WACC |
+| `valuation/franchise_value.py` | Growth value with ROIC-vs-WACC check |
+| `valuation/beta_calculator.py` | CAPM beta, Blume-adjusted beta, fundamental (levered) beta, Fama-French 3-factor regression → cost of equity |
+| `data/` | yfinance fetcher and financial-statement normaliser |
+| `utils/ai_financial_parser.py` | Optional: paste a 10-K excerpt and have an LLM extract the line items (bring your own API key; keys are never written into exported configs) |
+| `dashboard/app_enhanced.py` | Streamlit front end: AV → EPV → FV → summary → report export |
+
+## Run
 
 ```bash
-cd greenwald-av-epv-valuation-tool
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt   # if present
-./run.sh                          # or: streamlit run dashboard/...
+pip install -r requirements.txt
+./run.sh            # opens http://localhost:8501
 ```
 
-Company research notes and filings live in **`equity-research/companies/`**, not here.
+Note: the dashboard labels are currently in Chinese. The `valuation/` package can be used on its own from Python.
 
-Site (if deployed): https://zzzzzlm-003.github.io/Value-Investing/  
-(GitHub repo renamed to match this folder; Pages URL may still use the old name until updated.)
+## Limitations
+
+- Statement data comes from yfinance, which has gaps and occasional mislabelled lines. Check key inputs against the 10-K.
+- The intangible adjustments (royalty rate, marketing-capitalisation life, and so on) are judgement calls exposed as parameters, not estimated.
+
+See [`CHANGELOG.md`](CHANGELOG.md) for version history.
+
+## License
+
+MIT

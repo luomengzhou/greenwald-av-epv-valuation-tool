@@ -62,7 +62,7 @@ CONFIG_KEYS = [
     'roic_lease_interest', 'strict_course_mode', 'gdp_lt', 'g_cap_ov',
     'super_years', 'super_g', 'term_g',
     # AI 配置
-    'ai_provider', 'ai_model', 'openai_api_key', 'anthropic_api_key',
+    'ai_provider', 'ai_model',  # API keys deliberately excluded from saved config
     # 手动覆盖
     'wacc_override_pct', 'roic_override_pct',
 ]
