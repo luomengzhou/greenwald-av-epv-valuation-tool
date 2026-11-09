@@ -638,7 +638,7 @@ if analyze_button or st.session_state.analyzed:
     elif beta_method in ['ff3', 'ff5']:
         beta_result = beta_calc.estimate_ff3_beta()
         beta_value = beta_result.get('beta_market', 1.0)
-        beta_method_name = 'FF3估算'
+        beta_method_name = beta_result.get('method', 'FF3')
     else:
         beta_value = market_data.get('beta', 1.0)
         beta_method_name = 'Yahoo'
@@ -730,7 +730,7 @@ if analyze_button or st.session_state.analyzed:
                     comparison_data.append({
                         '模型': method_cfg['name'],
                         'Beta': f"{r.get('beta_market', 1.0):.3f}",
-                        'R²': '-',
+                        'R²': f"{r['r_squared']:.3f}" if 'r_squared' in r else '-',
                         '说明': method_cfg['usage']
                     })
             

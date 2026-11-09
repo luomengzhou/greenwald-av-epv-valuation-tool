@@ -1,5 +1,12 @@
 # 更新日志
 
+## v2.3 FF3 回归与测试 (2026-11-09)
+
+- `beta_calculator`: Fama-French 三因子由“分桶估算”改为真实 OLS 回归（numpy），自动下载 Kenneth French 月度因子；下载失败时回退估算并明确标注。CAPM Beta 标准误改为斜率标准误。yfinance 改为延迟导入，纯数学部分无需安装即可使用。
+- `adjustments.calculate_depreciation_adjustment`: capex 取绝对值，避免负号导致整笔折旧被当作过度折旧加回。
+- 新增 `tests/`（12 个 pytest 用例：Blume、Hamada、FF3 回归、EPV=NOPAT/WACC、FV 符号等）。
+- 修复 `docs/site` 仓库链接（旧用户名）；README 补充 AV（权益口径）vs EPV（企业口径）等限制说明。
+
 ## v2.2 Franchise Value增长分析 (2026-02-07)
 
 ### 🌟 重大新增：Franchise Value模块

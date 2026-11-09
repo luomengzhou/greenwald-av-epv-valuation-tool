@@ -261,7 +261,7 @@ class FranchiseValueCalculator:
                         # 有机增长通常低于总增长，保守估计为总增长的50-70%
                         organic = avg_growth * 0.6
                         return max(0, min(organic, 0.10))  # 上限10%
-            except:
+            except (TypeError, ValueError, ZeroDivisionError):
                 pass
         
         # 方法2：使用默认值

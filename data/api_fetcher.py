@@ -394,7 +394,7 @@ class DataFetcher:
                 rate = hist['Close'].iloc[-1] / 100  # 转换为小数
                 return rate
             return 0.043  # 默认4.3%
-        except:
+        except Exception:
             return 0.043
     
     def get_historical_market_data(self, period: str = "5y") -> dict:
@@ -537,7 +537,7 @@ class DataFetcher:
                 'total_employees': info.get('fullTimeEmployees', 0),
                 'description': info.get('longBusinessSummary', ''),
             }
-        except:
+        except Exception:
             return {'total_employees': 0, 'description': ''}
 
 

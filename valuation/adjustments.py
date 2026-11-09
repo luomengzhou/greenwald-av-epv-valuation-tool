@@ -207,8 +207,13 @@ class AdjustmentCalculator:
         Returns:
             float: 过度折旧额（正数表示过度折旧）
         """
+        # yfinance 的 Capital Expenditure 为负数（现金流出），统一取绝对值，
+        # 否则 maintenance_capex 会被截为 0，导致整笔折旧被当作“过度折旧”加回
+        capex = abs(float(capex or 0))
+        depreciation = abs(float(depreciation or 0))
+
         # 估算增长性资本支出
-        growth_capex = ppe_value * revenue_growth if ppe_value > 0 else 0
+        growth_capex = ppe_value * max(revenue_growth, 0) if ppe_value > 0 else 0
         
         # 维护性资本支出
         maintenance_capex = max(0, capex - growth_capex)

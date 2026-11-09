@@ -1,13 +1,20 @@
 """
 Beta计算模块 - 实现多种资产定价模型
 """
-import yfinance as yf
+import io
+import zipfile
+import urllib.request
 import pandas as pd
 import numpy as np
 from typing import Dict, Tuple, Optional
-from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
+
+
+def _yf():
+    """Import yfinance lazily so the pure-math parts of this module work without it."""
+    import yfinance as yf  # noqa: WPS433 (runtime import by design)
+    return yf
 
 
 class BetaCalculator:
@@ -46,6 +53,7 @@ class BetaCalculator:
         """
         try:
             # 获取股票和市场数据
+            yf = _yf()
             stock = yf.Ticker(self.ticker)
             market = yf.Ticker(self.market_index)
             
@@ -79,9 +87,14 @@ class BetaCalculator:
             correlation = combined['stock'].corr(combined['market'])
             r_squared = correlation ** 2
             
-            # 计算标准误差
-            residuals = combined['stock'] - (beta * combined['market'])
-            std_error = residuals.std() / np.sqrt(len(combined))
+            # 计算Beta的标准误差：SE(β) = sqrt(SSR/(n-2)) / sqrt(Σ(x-x̄)²)
+            x = combined['market'].to_numpy()
+            y = combined['stock'].to_numpy()
+            alpha = y.mean() - beta * x.mean()
+            residuals = y - alpha - beta * x
+            n = len(combined)
+            ssx = ((x - x.mean()) ** 2).sum()
+            std_error = float(np.sqrt((residuals ** 2).sum() / (n - 2)) / np.sqrt(ssx)) if n > 2 and ssx > 0 else float('nan')
             
             # Beta合理性检查
             warning = self._check_beta_validity(beta)
@@ -161,62 +174,122 @@ class BetaCalculator:
             'explanation': '基于Hamada公式，通过财务杠杆调整行业Beta'
         }
     
-    def estimate_ff3_beta(self) -> Dict:
+    def estimate_ff3_beta(self, period: str = '5y', factors: Optional[pd.DataFrame] = None) -> Dict:
         """
-        估算Fama-French三因子Beta（简化版）
-        
-        注：完整实现需要FF因子数据，这里提供估算
-        
+        Fama-French 三因子回归（完整版）
+
+        步骤：
+        1. 取股票月度收盘价，算月度收益；
+        2. 从 Kenneth French Data Library 下载 Mkt-RF / SMB / HML / RF 月度因子（或由 ``factors`` 传入）；
+        3. 按月份对齐，回归  R_i - RF = α + β_MKT(Mkt-RF) + β_SMB·SMB + β_HML·HML + ε（OLS）。
+
+        因子数据或价格数据不可得时，退回按市值 / P/B 分桶的粗略估算，并在 ``warning`` 中明确标注。
+
+        Args:
+            period: 价格数据周期（yfinance 格式，默认 5y）
+            factors: 可选，已下载好的因子 DataFrame（``FFFactorCalculator.get_ff_factors_from_web`` 的格式，小数收益）
+
         Returns:
-            Dict: FF3 Beta估算结果
+            Dict: 含 beta_market / beta_smb / beta_hml / alpha / r_squared / std_errors / observations / method / warning
         """
-        # 先计算CAPM Beta
+        try:
+            yf = _yf()
+            hist = yf.Ticker(self.ticker).history(period=period, interval='1mo')
+            if hist.empty:
+                raise ValueError('无价格数据')
+            close = hist['Close'].copy()
+            close.index = pd.to_datetime(close.index).tz_localize(None).to_period('M')
+            close = close.groupby(level=0).last()
+            stock_ret = close.pct_change().dropna()
+
+            if factors is None:
+                factors = FFFactorCalculator.get_ff_factors_from_web()
+            if factors is None or factors.empty:
+                raise ValueError('无法获取 Fama-French 因子数据')
+
+            df = pd.concat([stock_ret.rename('ret'), factors], axis=1, join='inner').dropna()
+            if len(df) < 24:
+                raise ValueError(f'对齐后数据点不足（{len(df)} < 24）')
+
+            reg = FFFactorCalculator.calculate_ff3_regression(
+                df['ret'] - df['RF'], df['Mkt-RF'], df['SMB'], df['HML']
+            )
+            premia = {
+                'Mkt-RF': float(factors['Mkt-RF'].mean() * 12),
+                'SMB': float(factors['SMB'].mean() * 12),
+                'HML': float(factors['HML'].mean() * 12),
+            }
+            rf_annual = float(factors['RF'].iloc[-12:].mean() * 12)
+            coe = FFFactorCalculator.ff3_cost_of_equity(
+                rf_annual, reg['beta_mkt'], reg['beta_smb'], reg['beta_hml'],
+                premia['Mkt-RF'], premia['SMB'], premia['HML'],
+            )
+            return {
+                'beta_market': reg['beta_mkt'],
+                'beta_smb': reg['beta_smb'],
+                'beta_hml': reg['beta_hml'],
+                'alpha_monthly': reg['alpha'],
+                'r_squared': reg['r_squared'],
+                'adj_r_squared': reg['adj_r_squared'],
+                'std_errors': reg['std_errors'],
+                't_stats': reg['t_stats'],
+                'observations': reg['observations'],
+                'factor_premia_annual': premia,
+                'rf_annual': rf_annual,
+                'cost_of_equity_ff3': coe,
+                'method': 'FF3回归',
+                'warning': self._check_beta_validity(reg['beta_mkt']),
+                'formula': (f"R_i-RF = {reg['alpha']:.4f} + {reg['beta_mkt']:.3f}·(Mkt-RF) "
+                            f"+ {reg['beta_smb']:.3f}·SMB + {reg['beta_hml']:.3f}·HML  (R²={reg['r_squared']:.2f}, n={reg['observations']})"),
+                'explanation': '月度 OLS 回归；因子溢价为样本期年化均值，权益成本 = RF + Σβ·溢价',
+                'data_source': 'Kenneth French Data Library: https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library.html',
+            }
+        except Exception as e:  # 回退到粗略估算
+            return self._estimate_ff3_beta_heuristic(f'FF3回归不可用（{e}），改用粗略估算')
+
+    def _estimate_ff3_beta_heuristic(self, reason: str = '') -> Dict:
+        """
+        FF3 粗略估算：市场β用 CAPM，SMB/HML 载荷按市值和 P/B 分桶给定经验值。
+
+        仅在因子数据不可得时作为回退使用；结果不应被当作回归估计。
+        """
         capm_result = self.calculate_capm_beta()
         market_beta = capm_result['beta']
-        
-        # 获取公司信息估算SMB和HML
         try:
-            stock = yf.Ticker(self.ticker)
-            info = stock.info
-            
+            info = _yf().Ticker(self.ticker).info
             market_cap = info.get('marketCap', 0)
             pb_ratio = info.get('priceToBook', 1.0)
-            
-            # 估算SMB Beta（基于市值）
+
             # 小盘股 SMB > 0，大盘股 SMB < 0
-            if market_cap > 200e9:  # 大于2000亿
+            if market_cap > 200e9:
                 smb_beta = -0.3
-            elif market_cap > 10e9:  # 100-2000亿
+            elif market_cap > 10e9:
                 smb_beta = 0.0
-            else:  # 小于100亿
+            else:
                 smb_beta = 0.5
-            
-            # 估算HML Beta（基于P/B）
+
             # 价值股 HML > 0，成长股 HML < 0
             if pb_ratio > 3.0:
-                hml_beta = -0.3  # 成长股
+                hml_beta = -0.3
             elif pb_ratio > 1.5:
                 hml_beta = 0.0
             else:
-                hml_beta = 0.4  # 价值股
-            
-            warning = '⚠️ 这是基于市值和估值的简化估算，完整计算需要FF因子数据'
-            
+                hml_beta = 0.4
+
             return {
                 'beta_market': market_beta,
                 'beta_smb': smb_beta,
                 'beta_hml': hml_beta,
                 'market_cap': market_cap,
                 'pb_ratio': pb_ratio,
-                'method': 'FF3估算',
-                'warning': warning,
-                'explanation': '需要完整FF因子数据才能精确计算',
+                'method': 'FF3估算（回退）',
+                'warning': '⚠️ ' + (f'{reason}；' if reason else '') + 'SMB/HML 为按市值与 P/B 分桶的经验值，并非回归结果',
+                'explanation': '回退估算：市场β来自 CAPM，SMB/HML 为经验分桶值',
                 'data_source': 'Kenneth French Data Library: https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library.html'
             }
-            
         except Exception as e:
             return self._default_beta_result(f"FF3估算失败: {str(e)}")
-    
+
     def _check_beta_validity(self, beta: float) -> str:
         """
         检查Beta合理性
@@ -287,10 +360,10 @@ class BetaCalculator:
             '适用': '新公司/重组'
         })
         
-        # 4. FF3（简化估算）
+        # 4. FF3（需下载因子数据，见 estimate_ff3_beta）
         results.append({
-            '方法': 'FF3估算',
-            'Beta': '需要因子数据',
+            '方法': 'FF3回归',
+            'Beta': '需联网获取因子数据',
             'R²': '-',
             '说明': '三因子模型',
             '适用': '学术/专业'
@@ -324,59 +397,118 @@ class BetaCalculator:
 
 
 class FFFactorCalculator:
-    """Fama-French因子计算器（简化版）"""
-    
+    """Fama-French 因子数据获取与三因子 OLS 回归（纯 numpy 实现，不依赖 statsmodels）"""
+
+    FF3_MONTHLY_URL = ('https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/'
+                       'F-F_Research_Data_Factors_CSV.zip')
+
     @staticmethod
-    def get_ff_factors_from_web() -> pd.DataFrame:
+    def parse_ff_csv(text: str) -> pd.DataFrame:
         """
-        从Kenneth French网站获取因子数据
-        
-        注：这需要网络访问和数据解析
-        实际使用时应该从本地缓存或API获取
-        
+        解析 Kenneth French 网站的因子 CSV 文本（月度块）。
+
+        文件格式：若干行说明 → 表头 ``,Mkt-RF,SMB,HML,RF`` → 月度行 ``YYYYMM,...`` →
+        空行 → ``Annual Factors`` 年度块。只保留 6 位 YYYYMM 的月度行，百分数转为小数。
+
         Returns:
-            DataFrame: FF因子数据
+            DataFrame: index 为月度 Period，列 ['Mkt-RF', 'SMB', 'HML', 'RF']（小数收益）
         """
-        # 实际URL: https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library.html
-        # 这里返回空DataFrame，实际使用时需要实现完整下载逻辑
-        
-        return pd.DataFrame()
-    
+        rows = []
+        for line in text.splitlines():
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) >= 5 and len(parts[0]) == 6 and parts[0].isdigit():
+                try:
+                    rows.append((parts[0], *[float(x) for x in parts[1:5]]))
+                except ValueError:
+                    continue
+        if not rows:
+            return pd.DataFrame(columns=['Mkt-RF', 'SMB', 'HML', 'RF'])
+        df = pd.DataFrame(rows, columns=['date', 'Mkt-RF', 'SMB', 'HML', 'RF'])
+        df.index = pd.PeriodIndex(pd.to_datetime(df.pop('date'), format='%Y%m'), freq='M')
+        return df / 100.0
+
+    @classmethod
+    def get_ff_factors_from_web(cls, timeout: int = 30) -> pd.DataFrame:
+        """
+        从 Kenneth French Data Library 下载月度三因子数据（Mkt-RF, SMB, HML, RF）。
+
+        Returns:
+            DataFrame: index 为月度 Period，收益为小数；下载失败返回空 DataFrame
+        """
+        try:
+            with urllib.request.urlopen(cls.FF3_MONTHLY_URL, timeout=timeout) as resp:
+                raw = resp.read()
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                name = [n for n in zf.namelist() if n.lower().endswith('.csv')][0]
+                text = zf.read(name).decode('utf-8', errors='ignore')
+            return cls.parse_ff_csv(text)
+        except Exception:
+            return pd.DataFrame(columns=['Mkt-RF', 'SMB', 'HML', 'RF'])
+
     @staticmethod
-    def calculate_ff3_regression(stock_returns: pd.Series,
-                                 market_returns: pd.Series,
+    def calculate_ff3_regression(stock_excess_returns: pd.Series,
+                                 market_excess_returns: pd.Series,
                                  smb_returns: pd.Series,
                                  hml_returns: pd.Series) -> Dict:
         """
-        FF3因子回归
-        
+        FF3 三因子 OLS 回归：R_i - RF = α + β_MKT(Mkt-RF) + β_SMB·SMB + β_HML·HML + ε
+
         Args:
-            stock_returns: 股票超额收益
-            market_returns: 市场超额收益
-            smb_returns: SMB因子收益
-            hml_returns: HML因子收益
-            
+            stock_excess_returns: 股票超额收益（已减 RF）
+            market_excess_returns: 市场超额收益 Mkt-RF
+            smb_returns: SMB 因子收益
+            hml_returns: HML 因子收益
+
         Returns:
-            Dict: 回归结果
+            Dict: beta_mkt / beta_smb / beta_hml / alpha / r_squared / adj_r_squared /
+                  std_errors / t_stats / observations
         """
-        # 需要使用statsmodels或sklearn进行多元回归
-        # 这里提供框架，实际需要实现
-        
-        from scipy import stats
-        
-        # 简化：只计算市场Beta（完整版需要多元回归）
-        slope, intercept, r_value, p_value, std_err = stats.linregress(
-            market_returns, stock_returns
-        )
-        
+        df = pd.concat(
+            [pd.Series(stock_excess_returns, name='y'),
+             pd.Series(market_excess_returns, name='mkt'),
+             pd.Series(smb_returns, name='smb'),
+             pd.Series(hml_returns, name='hml')],
+            axis=1, join='inner',
+        ).dropna()
+        n = len(df)
+        k = 3
+        if n <= k + 1:
+            raise ValueError(f'FF3 回归至少需要 {k + 2} 个观测，当前 {n}')
+
+        y = df['y'].to_numpy(dtype=float)
+        X = np.column_stack([np.ones(n), df[['mkt', 'smb', 'hml']].to_numpy(dtype=float)])
+        coef, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+        resid = y - X @ coef
+        ssr = float(resid @ resid)
+        sst = float(((y - y.mean()) ** 2).sum())
+        r2 = 1 - ssr / sst if sst > 0 else 0.0
+        adj_r2 = 1 - (1 - r2) * (n - 1) / (n - k - 1)
+        sigma2 = ssr / (n - k - 1)
+        cov = sigma2 * np.linalg.inv(X.T @ X)
+        se = np.sqrt(np.diag(cov))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            t = coef / se
+
+        names = ['alpha', 'beta_mkt', 'beta_smb', 'beta_hml']
         return {
-            'beta_mkt': slope,
-            'beta_smb': 0.0,  # 需要多元回归
-            'beta_hml': 0.0,  # 需要多元回归
-            'alpha': intercept,
-            'r_squared': r_value ** 2,
-            'p_value': p_value
+            'alpha': float(coef[0]),
+            'beta_mkt': float(coef[1]),
+            'beta_smb': float(coef[2]),
+            'beta_hml': float(coef[3]),
+            'r_squared': float(r2),
+            'adj_r_squared': float(adj_r2),
+            'std_errors': dict(zip(names, map(float, se))),
+            't_stats': dict(zip(names, map(float, t))),
+            'observations': int(n),
         }
+
+    @staticmethod
+    def ff3_cost_of_equity(rf: float, beta_mkt: float, beta_smb: float, beta_hml: float,
+                           mkt_premium: float, smb_premium: float, hml_premium: float) -> float:
+        """
+        FF3 权益成本：r_e = RF + β_MKT·MRP + β_SMB·E[SMB] + β_HML·E[HML]（全部为年化小数）
+        """
+        return float(rf + beta_mkt * mkt_premium + beta_smb * smb_premium + beta_hml * hml_premium)
 
 
 def get_recommended_beta_method(company_info: Dict) -> str:
